@@ -3,12 +3,14 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ginuerzh/gost"
 	"github.com/go-log/log"
@@ -128,6 +130,35 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		InsecureSkipVerify: !node.GetBool("secure"),
 		RootCAs:            rootCAs,
 	}
+
+	// If the argument `ca` is given, but not open `secure`, we verify the
+	// certificate manually.
+	if rootCAs != nil && !node.GetBool("secure") {
+		tlsCfg.VerifyConnection = func(state tls.ConnectionState) error {
+			opts := x509.VerifyOptions{
+				Roots:         rootCAs,
+				CurrentTime:   time.Now(),
+				DNSName:       "",
+				Intermediates: x509.NewCertPool(),
+			}
+
+			certs := state.PeerCertificates
+			for i, cert := range certs {
+				if i == 0 {
+					continue
+				}
+				opts.Intermediates.AddCert(cert)
+			}
+
+			_, err = certs[0].Verify(opts)
+			return err
+		}
+	}
+
+	if cert, err := tls.LoadX509KeyPair(node.Get("cert"), node.Get("key")); err == nil {
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
 	wsOpts := &gost.WSOptions{}
 	wsOpts.EnableCompression = node.GetBool("compression")
 	wsOpts.ReadBufferSize = node.GetInt("rbuf")
@@ -234,19 +265,20 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		connector = gost.AutoConnector(node.User)
 	}
 
+	host := node.Get("host")
+	if host == "" {
+		host = node.Host
+	}
+
 	node.DialOptions = append(node.DialOptions,
 		gost.TimeoutDialOption(timeout),
+		gost.HostDialOption(host),
 	)
 
 	node.ConnectOptions = []gost.ConnectOption{
 		gost.UserAgentConnectOption(node.Get("agent")),
 		gost.NoTLSConnectOption(node.GetBool("notls")),
 		gost.NoDelayConnectOption(node.GetBool("nodelay")),
-	}
-
-	host := node.Get("host")
-	if host == "" {
-		host = node.Host
 	}
 
 	sshConfig := &gost.SSHConfig{}
@@ -342,7 +374,7 @@ func (r *route) GenRouters() ([]router, error) {
 			}
 		}
 		certFile, keyFile := node.Get("cert"), node.Get("key")
-		tlsCfg, err := tlsConfig(certFile, keyFile)
+		tlsCfg, err := tlsConfig(certFile, keyFile, node.Get("ca"))
 		if err != nil && certFile != "" && keyFile != "" {
 			return nil, err
 		}
